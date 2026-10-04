@@ -1,9 +1,10 @@
 """SQLite database connection management."""
 
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+
 from app.config import settings
 
 

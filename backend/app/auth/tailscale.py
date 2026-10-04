@@ -1,9 +1,9 @@
 """Tailscale authentication provider."""
 
-from typing import Optional
-from fastapi import Request
-from app.auth.provider import AuthProvider, RequestLike
+
+
 from app.auth.models import UserIdentity
+from app.auth.provider import AuthProvider, RequestLike
 
 
 class TailscaleProvider(AuthProvider):
@@ -13,7 +13,7 @@ class TailscaleProvider(AuthProvider):
     def name(self) -> str:
         return "tailscale"
 
-    async def authenticate(self, request: RequestLike) -> Optional[UserIdentity]:
+    async def authenticate(self, request: RequestLike) -> UserIdentity | None:
         """
         Extract Tailscale identity from request headers.
 

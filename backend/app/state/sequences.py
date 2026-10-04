@@ -1,7 +1,6 @@
 """Sequence number management for WebSocket updates."""
 
 import asyncio
-from typing import Optional
 
 
 class SequenceManager:

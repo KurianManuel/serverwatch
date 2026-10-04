@@ -1,14 +1,14 @@
 """Base collector classes and protocols."""
 
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
-from typing import Any, Generic, TypeVar
-import time
+from enum import StrEnum
+from typing import Generic, TypeVar
 
 
-class CollectorStatus(str, Enum):
+class CollectorStatus(StrEnum):
     """Collector status states."""
 
     INITIALIZING = "INITIALIZING"

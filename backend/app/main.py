@@ -1,8 +1,10 @@
 """ServerWatch FastAPI application entry point."""
 
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+
 from fastapi import FastAPI
+
 from app.api.router import api_router
 from app.config import settings
 

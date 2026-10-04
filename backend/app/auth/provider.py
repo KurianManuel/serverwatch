@@ -1,7 +1,9 @@
 """Authentication provider abstraction."""
 
 from abc import ABC, abstractmethod
-from typing import Optional, Protocol, Mapping, Any
+from collections.abc import Mapping
+from typing import Any, Protocol
+
 from app.auth.models import UserIdentity
 
 
@@ -21,13 +23,13 @@ class AuthProvider(ABC):
         ...
 
     @abstractmethod
-    async def authenticate(self, request: RequestLike) -> Optional[UserIdentity]:
+    async def authenticate(self, request: RequestLike) -> UserIdentity | None:
         """Authenticate a request and return user identity."""
         ...
 
-    async def authenticate_any(self, request: Any) -> Optional[UserIdentity]:
+    async def authenticate_any(self, request: Any) -> UserIdentity | None:
         """Wrapper to accept any request type."""
-        return await self.authenticate(request)  # type: ignore[arg-type]
+        return await self.authenticate(request)
 
 
 class ProviderRegistry:
@@ -40,7 +42,7 @@ class ProviderRegistry:
         """Register a provider."""
         self._providers[provider.name] = provider
 
-    def get(self, name: str) -> Optional[AuthProvider]:
+    def get(self, name: str) -> AuthProvider | None:
         """Get a provider by name."""
         return self._providers.get(name)
 

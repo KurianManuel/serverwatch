@@ -1,7 +1,19 @@
 """Main API router."""
 
 from fastapi import APIRouter
-from app.api.v1 import state, metrics, network, storage, processes, services, events, alerts, health, history
+
+from app.api.v1 import (
+    alerts,
+    events,
+    health,
+    history,
+    metrics,
+    network,
+    processes,
+    services,
+    state,
+    storage,
+)
 from app.api.v1.system import router as system_router
 
 api_router = APIRouter(prefix="/api/v1")

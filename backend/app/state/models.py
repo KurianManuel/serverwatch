@@ -2,12 +2,13 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
-from typing import Any, Optional
+from enum import StrEnum
+from typing import Any
+
 from app.collectors.base import CollectorStatus
 
 
-class DataStatus(str, Enum):
+class DataStatus(StrEnum):
     """Data freshness status."""
 
     CURRENT = "current"

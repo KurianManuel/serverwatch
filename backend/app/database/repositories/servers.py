@@ -1,14 +1,18 @@
 """Servers repository."""
 
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import sqlite3  # noqa: F401
+
 import uuid
-from typing import Optional, Any
-import sqlite3
+
 from app.database.connection import database_connection
 
 
 class ServersRepository:
     def get_or_create_server(self, hostname: str) -> str:
-        with database_connection() as conn:  # type: sqlite3.Connection
+        with database_connection() as conn:  # type: "sqlite3.Connection"
             cursor = conn.execute("SELECT id FROM servers WHERE hostname = ?", (hostname,))
             row = cursor.fetchone()
             if row:
@@ -22,8 +26,8 @@ class ServersRepository:
             conn.commit()
             return server_id
 
-    def get_server(self, server_id: str) -> Optional[Any]:
-        with database_connection() as conn:  # type: sqlite3.Connection
+    def get_server(self, server_id: str) -> Any | None:
+        with database_connection() as conn:  # type: "sqlite3.Connection"
             cursor = conn.execute("SELECT * FROM servers WHERE id = ?", (server_id,))
             return cursor.fetchone()
 

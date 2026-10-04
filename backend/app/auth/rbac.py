@@ -1,17 +1,16 @@
 """Role-based access control."""
 
-from enum import Enum
-from typing import Set
+from enum import StrEnum
 
 
-class Role(str, Enum):
+class Role(StrEnum):
     """Application roles."""
 
     VIEWER = "Viewer"
     ADMINISTRATOR = "Administrator"
 
 
-class Permission(str, Enum):
+class Permission(StrEnum):
     """Application permissions."""
 
     READ_DASHBOARD = "read:dashboard"
@@ -26,7 +25,7 @@ class Permission(str, Enum):
     MANAGE_USERS = "manage:users"
 
 
-ROLE_PERMISSIONS: dict[Role, Set[Permission]] = {
+ROLE_PERMISSIONS: dict[Role, set[Permission]] = {
     Role.VIEWER: {
         Permission.READ_DASHBOARD,
         Permission.READ_METRICS,
@@ -52,8 +51,8 @@ ROLE_PERMISSIONS: dict[Role, Set[Permission]] = {
 }
 
 
-def get_permissions_for_roles(roles: Set[str]) -> Set[Permission]:
-    permissions: Set[Permission] = set()
+def get_permissions_for_roles(roles: set[str]) -> set[Permission]:
+    permissions: set[Permission] = set()
     for role_str in roles:
         try:
             role = Role(role_str)
@@ -63,6 +62,6 @@ def get_permissions_for_roles(roles: Set[str]) -> Set[Permission]:
     return permissions
 
 
-def has_permission(roles: Set[str], permission: Permission) -> bool:
+def has_permission(roles: set[str], permission: Permission) -> bool:
     permissions = get_permissions_for_roles(roles)
     return permission in permissions

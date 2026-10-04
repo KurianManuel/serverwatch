@@ -2,22 +2,14 @@
 
 from datetime import datetime
 from typing import Any
+
+from app.collectors.base import CollectorResult, CollectorStatus
 from app.state.models import (
-    SystemStateSnapshot,
-    CPUState,
     MemoryState,
-    DiskState,
-    NetworkState,
-    FilesystemState,
-    TemperatureState,
-    ProcessState,
-    ServiceState,
-    SystemState,
-    ServerWatchHealth,
     MetricValue,
-    DataStatus,
+    SystemState,
+    SystemStateSnapshot,
 )
-from app.collectors.base import CollectorStatus, CollectorResult
 
 
 class StateManager:
@@ -239,10 +231,10 @@ class StateManager:
         self._collector_status[collector_name] = CollectorStatus.FAILED
         self._state.serverwatch_health.collectors = self._collector_status.copy()
 
-    def get_state_for_websocket(self) -> dict:
+    def get_state_for_websocket(self) -> dict[str, Any]:
         """Get state formatted for WebSocket transmission."""
         # Convert to serializable format
-        def serialize_metric(m: MetricValue) -> dict:
+        def serialize_metric(m: MetricValue) -> dict[str, Any]:
             return {
                 "value": m.value,
                 "timestamp": m.timestamp.isoformat() + "Z",

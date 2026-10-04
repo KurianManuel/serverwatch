@@ -3,10 +3,12 @@
 import asyncio
 import sqlite3
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any
+
 from app.config import settings
 from app.database.connection import database_connection
 
@@ -23,7 +25,7 @@ class WriteTask:
     priority: WritePriority
     table: str
     data: dict[str, Any]
-    callback: Optional[Callable[[bool], None]] = None
+    callback: Callable[[bool], None] | None = None
     timestamp: datetime = datetime.utcnow()
 
 
@@ -33,7 +35,7 @@ class DatabaseWriter:
         self._batch_size = settings.db_batch_size
         self._flush_interval = settings.db_flush_interval
         self._running = False
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         self._running = True
