@@ -23,16 +23,19 @@ class MetricValue:
 
     value: Any
     timestamp: datetime = field(default_factory=datetime.utcnow)
+    monotonic_timestamp: float = field(default_factory=lambda: __import__("time").monotonic())
     status: DataStatus = DataStatus.CURRENT
     collector: str = ""
     stale_threshold_seconds: float = 30.0
 
-    def is_stale(self) -> bool:
-        """Check if the value is stale."""
+    def is_stale(self, now_monotonic: float | None = None) -> bool:
+        """Check if the value is stale using monotonic time."""
         if self.status != DataStatus.CURRENT:
             return True
-        age = (datetime.utcnow() - self.timestamp).total_seconds()
-        return age > self.stale_threshold_seconds
+        import time
+
+        now = now_monotonic if now_monotonic is not None else time.monotonic()
+        return (now - self.monotonic_timestamp) > self.stale_threshold_seconds
 
 
 @dataclass
@@ -84,6 +87,8 @@ class TemperatureState:
     """Temperature state per sensor."""
 
     sensors: dict[str, MetricValue] = field(default_factory=dict)
+    thresholds: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
+    # sensor_name -> (high, critical) in degrees C
 
 
 @dataclass
@@ -126,6 +131,31 @@ class ServerWatchHealth:
 
 
 @dataclass
+class StateTransition:
+    """State transition event for Event Engine."""
+
+    sequence: int
+    timestamp_monotonic: float
+    timestamp_wall: datetime
+    collector: str
+    changed_paths: list[str]
+    old_status: CollectorStatus
+    new_status: CollectorStatus
+    is_health_transition: bool
+
+
+@dataclass
+class StateUpdate:
+    """State update (snapshot or incremental)."""
+
+    sequence: int
+    timestamp_wall: datetime
+    snapshot: "SystemStateSnapshot | None" = None
+    changed: dict[str, MetricValue] = field(default_factory=dict)
+    transitions: list[StateTransition] = field(default_factory=list)
+
+
+@dataclass
 class SystemStateSnapshot:
     """Complete system state snapshot."""
 
@@ -149,7 +179,7 @@ class SystemStateSnapshot:
     disk: DiskState = field(default_factory=lambda: DiskState(devices={}))
     network: NetworkState = field(default_factory=lambda: NetworkState(interfaces={}))
     filesystem: FilesystemState = field(default_factory=lambda: FilesystemState(mounts={}))
-    temperature: TemperatureState = field(default_factory=lambda: TemperatureState(sensors={}))
+    temperature: TemperatureState = field(default_factory=lambda: TemperatureState(sensors={}, thresholds={}))
     processes: ProcessState = field(default_factory=lambda: ProcessState(processes=[]))
     services: ServiceState = field(default_factory=lambda: ServiceState(services={}))
     system: SystemState = field(default_factory=lambda: SystemState(
