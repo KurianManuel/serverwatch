@@ -696,70 +696,195 @@ Do not add them without an actual MVP requirement.
 Logical fields:
 
 ```text
-id                stable UUID
-hostname
-display_name
-os_name
-os_version
-kernel_version
-architecture
-created_at
-updated_at
+id                TEXT PRIMARY KEY, stable UUID
+hostname          TEXT NOT NULL
+display_name      TEXT
+os_name           TEXT
+os_version        TEXT
+kernel_version    TEXT
+architecture      TEXT
+created_at        TIMESTAMP DEFAULT (datetime('now'))
+updated_at        TIMESTAMP DEFAULT (datetime('now'))
 ```
+
+Index: `idx_servers_hostname ON servers(hostname)`
 
 The server UUID must remain stable across application restarts.
 
-## 10.3 Samples
-
-Sample tables must contain:
-
-- server ID
-- timestamp
-- required metric dimensions
-- metric values
-
-Avoid storing large JSON blobs for data that will be frequently charted/queryed.
-
-JSON may be used for genuinely variable metadata.
-
-## 10.4 Events
+## 10.3 CPU Samples
 
 Logical fields:
 
 ```text
-id
-server_id
-timestamp
-event_type
-severity
-source
-title
-message
-metadata
+id                  INTEGER PRIMARY KEY AUTOINCREMENT
+server_id           TEXT NOT NULL REFERENCES servers(id)
+timestamp           TIMESTAMP NOT NULL
+total_utilization   REAL
+per_core            TEXT NOT NULL      -- JSON array of per-core utilization
+load_1min           REAL
+load_5min           REAL
+load_15min          REAL
+cpu_count           INTEGER
 ```
+
+Index: `idx_cpu_samples_server_time ON cpu_samples(server_id, timestamp DESC)`
+
+## 10.4 Memory Samples
+
+Logical fields:
+
+```text
+id                  INTEGER PRIMARY KEY AUTOINCREMENT
+server_id           TEXT NOT NULL REFERENCES servers(id)
+timestamp           TIMESTAMP NOT NULL
+total_bytes         INTEGER NOT NULL
+available_bytes     INTEGER NOT NULL
+used_bytes          INTEGER NOT NULL
+free_bytes          INTEGER
+buffers_bytes       INTEGER
+cached_bytes        INTEGER
+swap_total_bytes    INTEGER
+swap_used_bytes     INTEGER
+swap_free_bytes     INTEGER
+```
+
+Index: `idx_memory_samples_server_time ON memory_samples(server_id, timestamp DESC)`
+
+## 10.5 Disk Samples
+
+Logical fields:
+
+```text
+id                  INTEGER PRIMARY KEY AUTOINCREMENT
+server_id           TEXT NOT NULL REFERENCES servers(id)
+timestamp           TIMESTAMP NOT NULL
+device              TEXT NOT NULL
+read_bytes          INTEGER
+write_bytes         INTEGER
+read_ops            INTEGER
+write_ops           INTEGER
+read_throughput     REAL
+write_throughput    REAL
+iops                REAL
+```
+
+Indexes:
+- `idx_disk_samples_server_time ON disk_samples(server_id, timestamp DESC)`
+- `idx_disk_samples_device ON disk_samples(server_id, device, timestamp DESC)`
+
+## 10.6 Network Samples
+
+Logical fields:
+
+```text
+id                  INTEGER PRIMARY KEY AUTOINCREMENT
+server_id           TEXT NOT NULL REFERENCES servers(id)
+timestamp           TIMESTAMP NOT NULL
+interface           TEXT NOT NULL
+rx_bytes            INTEGER
+tx_bytes            INTEGER
+rx_packets          INTEGER
+tx_packets          INTEGER
+rx_errors           INTEGER
+tx_errors           INTEGER
+rx_drops            INTEGER
+tx_drops            INTEGER
+```
+
+Indexes:
+- `idx_network_samples_server_time ON network_samples(server_id, timestamp DESC)`
+- `idx_network_samples_interface ON network_samples(server_id, interface, timestamp DESC)`
+
+## 10.7 Filesystem Samples
+
+Logical fields:
+
+```text
+id                  INTEGER PRIMARY KEY AUTOINCREMENT
+server_id           TEXT NOT NULL REFERENCES servers(id)
+timestamp           TIMESTAMP NOT NULL
+mount_point         TEXT NOT NULL
+device              TEXT
+fstype              TEXT
+total_bytes         INTEGER
+free_bytes          INTEGER
+available_bytes     INTEGER
+used_bytes          INTEGER
+used_percent        REAL
+inodes_total        INTEGER
+inodes_free         INTEGER
+```
+
+Indexes:
+- `idx_filesystem_samples_server_time ON filesystem_samples(server_id, timestamp DESC)`
+- `idx_filesystem_samples_mount ON filesystem_samples(server_id, mount_point, timestamp DESC)`
+
+## 10.8 Temperature Samples
+
+Logical fields:
+
+```text
+id                  INTEGER PRIMARY KEY AUTOINCREMENT
+server_id           TEXT NOT NULL REFERENCES servers(id)
+timestamp           TIMESTAMP NOT NULL
+sensor_name         TEXT NOT NULL
+sensor_label        TEXT
+temperature_celsius REAL
+high_threshold      REAL
+critical_threshold  REAL
+```
+
+Indexes:
+- `idx_temperature_samples_server_time ON temperature_samples(server_id, timestamp DESC)`
+- `idx_temperature_samples_sensor ON temperature_samples(server_id, sensor_name, timestamp DESC)`
+
+## 10.9 Events
+
+Logical fields:
+
+```text
+id                  INTEGER PRIMARY KEY AUTOINCREMENT
+server_id           TEXT NOT NULL REFERENCES servers(id)
+timestamp           TIMESTAMP NOT NULL
+event_type          TEXT NOT NULL
+severity            TEXT NOT NULL
+source              TEXT
+title               TEXT
+message             TEXT
+metadata            TEXT
+```
+
+Indexes:
+- `idx_events_server_time ON events(server_id, timestamp DESC)`
+- `idx_events_type ON events(server_id, event_type, timestamp DESC)`
+- `idx_events_severity ON events(server_id, severity, timestamp DESC)`
 
 Do not store secrets.
 
-## 10.5 Alerts
+## 10.10 Alerts
 
 Logical fields:
 
 ```text
-id
-server_id
-rule_id
-state
-severity
-condition
-first_seen
-last_seen
-fired_at
-recovered_at
-metadata
+id                  INTEGER PRIMARY KEY AUTOINCREMENT
+server_id           TEXT NOT NULL REFERENCES servers(id)
+rule_id             TEXT NOT NULL
+state               TEXT NOT NULL
+severity            TEXT NOT NULL
+condition           TEXT
+first_seen          TIMESTAMP NOT NULL
+last_seen           TIMESTAMP NOT NULL
+fired_at            TIMESTAMP
+recovered_at        TIMESTAMP
+metadata            TEXT
 ```
 
-State:
+Indexes:
+- `idx_alerts_server_time ON alerts(server_id, first_seen DESC)`
+- `idx_alerts_state ON alerts(server_id, state, first_seen DESC)`
+- `idx_alerts_rule ON alerts(server_id, rule_id, first_seen DESC)`
 
+State:
 ```text
 OK
 PENDING
@@ -767,16 +892,47 @@ FIRING
 RECOVERED
 ```
 
-## 10.6 Rollups
+## 10.11 Metric Rollups
+
+Logical fields:
+
+```text
+id                  INTEGER PRIMARY KEY AUTOINCREMENT
+server_id           TEXT NOT NULL REFERENCES servers(id)
+metric_name         TEXT NOT NULL
+interval_type       TEXT NOT NULL
+window_start        TIMESTAMP NOT NULL
+window_end          TIMESTAMP NOT NULL
+count               INTEGER NOT NULL
+min_value           REAL NOT NULL
+avg_value           REAL NOT NULL
+max_value           REAL NOT NULL
+```
+
+Indexes:
+- `idx_rollups_server_metric_time ON metric_rollups(server_id, metric_name, window_start DESC)`
+- `idx_rollups_interval ON metric_rollups(interval_type, window_start DESC)`
+- `idx_rollups_unique ON metric_rollups(server_id, metric_name, interval_type, window_start)` (UNIQUE)
 
 Rollups must support:
-
 - minimum
 - average
 - maximum
 - count
 
 Additional percentile statistics may be added later.
+
+## 10.12 Schema Metadata
+
+Logical fields:
+
+```text
+version         INTEGER PRIMARY KEY
+applied_at      TIMESTAMP DEFAULT (datetime('now'))
+description     TEXT
+```
+
+Version 1 is recorded LAST - only if all schema creation succeeds.
 
 ---
 
