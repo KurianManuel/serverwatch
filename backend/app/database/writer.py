@@ -5,15 +5,76 @@ import queue
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
-from typing import Any, Optional
-
+from typing import Any
 
 from app.database.config import DBConfig, get_db_config
 from app.database.connection import _apply_pragmas
+
+# Valid table names for SQL injection prevention
+VALID_TABLES = {
+    "servers",
+    "cpu_samples",
+    "memory_samples",
+    "disk_samples",
+    "network_samples",
+    "filesystem_samples",
+    "temperature_samples",
+    "events",
+    "alerts",
+    "metric_rollups",
+}
+
+# Valid columns per table (for validation)
+VALID_COLUMNS = {
+    "servers": {
+        "id", "hostname", "display_name", "os_name", "os_version",
+        "kernel_version", "architecture", "tailscale_ip", "last_seen",
+        "created_at", "updated_at"
+    },
+    "cpu_samples": {
+        "id", "server_id", "timestamp", "total_utilization", "per_core",
+        "load_1min", "load_5min", "load_15min", "cpu_count"
+    },
+    "memory_samples": {
+        "id", "server_id", "timestamp", "total_bytes", "available_bytes",
+        "used_bytes", "free_bytes", "cached_bytes", "swap_total_bytes",
+        "swap_used_bytes"
+    },
+    "disk_samples": {
+        "id", "server_id", "timestamp", "device", "read_bytes", "write_bytes",
+        "read_ops", "write_ops", "read_time_ms", "write_time_ms"
+    },
+    "network_samples": {
+        "id", "server_id", "timestamp", "interface", "rx_bytes", "tx_bytes",
+        "rx_packets", "tx_packets", "rx_errors", "tx_errors", "rx_dropped", "tx_dropped"
+    },
+    "filesystem_samples": {
+        "id", "server_id", "timestamp", "mount_point", "device", "fstype",
+        "total_bytes", "free_bytes", "available_bytes", "used_bytes",
+        "inodes_total", "inodes_free"
+    },
+    "temperature_samples": {
+        "id", "server_id", "timestamp", "sensor_name", "temperature_celsius",
+        "sensor_type", "is_critical"
+    },
+    "events": {
+        "id", "server_id", "timestamp", "event_type", "severity", "source",
+        "title", "message", "metadata"
+    },
+    "alerts": {
+        "id", "server_id", "rule_id", "state", "severity", "condition",
+        "current_value", "threshold", "first_seen", "last_seen",
+        "acknowledged_at", "acknowledged_by", "resolved_at"
+    },
+    "metric_rollups": {
+        "id", "server_id", "metric_name", "interval_type", "window_start",
+        "window_end", "count", "min_value", "avg_value", "max_value",
+        "sum_value", "std_dev"
+    },
+}
 
 
 class WritePriority(IntEnum):
@@ -32,7 +93,7 @@ class WriteTask:
     sequence: int
     table: str
     data: dict[str, Any]
-    future: Optional[asyncio.Future[bool]] = field(default=None, compare=False)
+    future: asyncio.Future[bool] | None = field(default=None, compare=False)
     timestamp: datetime = field(default_factory=datetime.utcnow, compare=False)
 
     def __post_init__(self) -> None:
@@ -86,6 +147,9 @@ class DatabaseWriter:
         self._sequence_lock = threading.Lock()
         self._metrics = WriterMetrics()
         self._metrics_lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # Lock for queue mutations that must be atomic (eviction/rebuild)
+        self._queue_lock = threading.Lock()
 
     def start(self) -> None:
         """Start the writer thread."""
@@ -94,6 +158,7 @@ class DatabaseWriter:
         self._running = True
         self._shutdown_event.clear()
         self._drain_complete.clear()
+        # Event loop captured lazily on first write()
         self._writer_thread = threading.Thread(target=self._writer_loop, name="serverwatch-db-writer", daemon=False)
         self._writer_thread.start()
 
@@ -120,6 +185,7 @@ class DatabaseWriter:
             self._writer_thread.join(timeout=1.0)
 
         self._writer_thread = None
+        self._loop = None
         return drained
 
     async def write(
@@ -136,13 +202,22 @@ class DatabaseWriter:
             table: Target table name.
             data: Column-value mapping for INSERT.
             priority: Write priority for queue ordering.
-            timeout: Maximum time to wait for queue space.
+            timeout: Maximum time to wait for queue space (not used, kept for API compatibility).
 
         Returns:
-            True if enqueued successfully, False if timeout, queue full, or writer stopped.
+            True if enqueued successfully, False if queue full or writer stopped.
             Write failures are recorded in metrics, not returned here.
         """
         if not self._running:
+            return False
+
+        # Capture event loop on first write
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
+
+        # Validate table and columns
+        if not self._validate_table_and_columns(table, data):
+            self._record_drop()
             return False
 
         task = WriteTask(
@@ -150,28 +225,52 @@ class DatabaseWriter:
             sequence=self._next_sequence(),
             table=table,
             data=data,
-            future=asyncio.get_running_loop().create_future(),
+            future=self._loop.create_future(),
         )
 
         try:
             # Direct call - put_nowait is non-blocking
-            # timeout parameter kept for API compatibility
             self._enqueue_task(task)
         except queue.Full:
             self._record_drop()
+            if task.future and not task.future.done():
+                task.future.set_result(False)
             return False
 
         self._record_enqueued()
         return True
 
+    def _validate_table_and_columns(self, table: str, data: dict[str, Any]) -> bool:
+        """Validate table name and column names against allowlist."""
+        if table not in VALID_TABLES:
+            return False
+        valid_cols = VALID_COLUMNS.get(table, set())
+        for col in data.keys():
+            if col not in valid_cols:
+                return False
+        return True
+
     def _enqueue_task(self, task: WriteTask) -> None:
         """Enqueue task with priority-based eviction when full."""
+        # Fast path: try non-blocking put
         try:
             self._queue.put_nowait(task)
+            return
         except queue.Full:
+            pass
+
+        # Slow path: queue full, need eviction logic - must be atomic
+        with self._queue_lock:
+            # Re-check queue state after acquiring lock
+            try:
+                self._queue.put_nowait(task)
+                return
+            except queue.Full:
+                pass
+
             # Queue full - try to evict lowest priority task if new task has higher priority
             if task.priority <= WritePriority.NORMAL:
-                raise queue.Full("Queue full and priority not high enough for eviction")
+                raise queue.Full("Queue full and priority not high enough for eviction") from None
 
             # Priority queue doesn't support direct inspection of lowest priority item.
             # Drain queue, remove lowest priority, re-insert remaining + new task.
@@ -183,15 +282,15 @@ class DatabaseWriter:
                     break
 
             if not items:
-                raise queue.Full("Queue full")
+                raise queue.Full("Queue full") from None
 
             # Find item with lowest priority (highest sort_key since negative priority)
             lowest_idx = max(range(len(items)), key=lambda i: items[i].sort_key)
             evicted = items.pop(lowest_idx)
 
-            # Mark evicted task as failed
-            if evicted.future and not evicted.future.done():
-                evicted.future.set_result(False)
+            # Mark evicted task as failed - use thread-safe call_soon_threadsafe
+            if evicted.future and not evicted.future.done() and self._loop:
+                self._loop.call_soon_threadsafe(evicted.future.set_result, False)
             self._record_drop()
 
             # Re-insert remaining items
@@ -292,56 +391,67 @@ class DatabaseWriter:
                 last_flush = now
 
     def _collect_batch(self) -> list[WriteTask]:
-        """Collect up to batch_size tasks from the queue."""
+        """Collect up to batch_size tasks from the queue.
+
+        Acquires _queue_lock to synchronize with eviction logic.
+        """
         batch: list[WriteTask] = []
         deadline = time.monotonic() + self._flush_interval
 
-        while len(batch) < self._batch_size:
-            try:
-                # Non-blocking get with short timeout to check shutdown
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+        with self._queue_lock:
+            while len(batch) < self._batch_size:
+                try:
+                    # Non-blocking get with short timeout to check shutdown
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    task = self._queue.get(timeout=min(0.1, remaining))
+                    batch.append(task)
+                except queue.Empty:
                     break
-                task = self._queue.get(timeout=min(0.1, remaining))
-                batch.append(task)
-            except queue.Empty:
-                break
 
         return batch
 
     def _flush_batch(self, conn: sqlite3.Connection, batch: list[WriteTask]) -> None:
-        """Execute a batch of writes in a single transaction."""
+        """Execute a batch of writes in a single transaction.
+
+        All tasks in the batch succeed or fail together (atomic).
+        """
         if not batch:
             return
 
         try:
             conn.execute("BEGIN IMMEDIATE TRANSACTION;")
+            # Execute all inserts first - if any fails, we rollback
             for task in batch:
-                try:
-                    self._execute_insert(conn, task.table, task.data)
-                    if task.future and not task.future.done():
-                        task.future.set_result(True)
-                    self._record_success()
-                except Exception as e:
-                    error_msg = f"Write failed for {task.table}: {e}"
-                    self._record_failure(error_msg)
-                    if task.future and not task.future.done():
-                        task.future.set_result(False)
+                self._execute_insert(conn, task.table, task.data)
+            # All inserts succeeded - commit
             conn.execute("COMMIT;")
+            # Now mark all tasks as successful
+            for task in batch:
+                self._resolve_future(task, True)
+                self._record_success()
         except Exception as e:
-            # Transaction failed - rollback and mark all tasks as failed
+            # Any failure - rollback entire transaction
             try:
                 conn.execute("ROLLBACK;")
             except sqlite3.OperationalError:
                 pass
             error_msg = f"Transaction failed: {e}"
-            self._record_failure(error_msg)
+            # Record failure for EACH task in the batch (atomic rollback)
+            for _ in batch:
+                self._record_failure(error_msg)
             for task in batch:
-                if task.future and not task.future.done():
-                    task.future.set_result(False)
+                self._resolve_future(task, False)
+
+    def _resolve_future(self, task: WriteTask, result: bool) -> None:
+        """Thread-safely resolve the task's future."""
+        if task.future and not task.future.done() and self._loop:
+            self._loop.call_soon_threadsafe(task.future.set_result, result)
 
     def _execute_insert(self, conn: sqlite3.Connection, table: str, data: dict[str, Any]) -> None:
-        """Execute a single INSERT statement."""
+        """Execute a single INSERT statement with validated identifiers."""
+        # Table and columns already validated in write()
         columns = ", ".join(data.keys())
         placeholders = ", ".join("?" * len(data))
         values = tuple(data.values())

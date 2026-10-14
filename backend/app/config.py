@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     retention_raw_hours: int = 24
     retention_1min_days: int = 7
     retention_5min_days: int = 30
+    retention_1h_days: int = 365
+    retention_1d_days: int = 730
     rate_limit_requests: int = 100
     rate_limit_window: int = 60
 

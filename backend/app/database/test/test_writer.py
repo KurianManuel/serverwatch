@@ -1,9 +1,10 @@
 """Tests for the database writer."""
 
 import asyncio
-import sqlite3
 import tempfile
+from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,7 +13,6 @@ from app.database.migrations import run_migrations
 from app.database.writer import (
     DatabaseWriter,
     WritePriority,
-    WriterMetrics,
     get_db_writer,
     start_db_writer,
     stop_db_writer,
@@ -20,7 +20,7 @@ from app.database.writer import (
 
 
 @pytest.fixture
-def temp_db_path() -> str:
+def temp_db_path() -> Generator[str, None, None]:
     """Create a temporary database file path."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
@@ -38,7 +38,7 @@ def migrated_db(temp_db_path: str) -> str:
 
 
 @pytest.fixture
-def writer_config(migrated_db: str) -> DatabaseWriter:
+def writer_config(migrated_db: str) -> Generator[DatabaseWriter, None, None]:
     """Create a DatabaseWriter with test configuration."""
     from app.database.config import DBConfig
     config = DBConfig(
@@ -263,18 +263,18 @@ class TestWriterFailureHandling:
 
     @pytest.mark.asyncio
     async def test_invalid_table_failure_handled(self, writer_config: DatabaseWriter) -> None:
-        """Test that invalid table names are handled gracefully."""
+        """Test that invalid table names are rejected at enqueue time."""
         result = await writer_config.write(
             "non_existent_table",
             {"id": "test"},
             priority=WritePriority.NORMAL,
         )
-        assert result is True  # Enqueue succeeded
+        # Invalid table is rejected at enqueue time (validation)
+        assert result is False
 
-        await asyncio.sleep(0.3)
-
+        # Should be counted as dropped
         metrics = writer_config.get_metrics()
-        assert metrics.failed >= 1
+        assert metrics.dropped >= 1
 
     @pytest.mark.asyncio
     async def test_malformed_data_failure_handled(self, writer_config: DatabaseWriter) -> None:
@@ -291,6 +291,55 @@ class TestWriterFailureHandling:
 
         metrics = writer_config.get_metrics()
         assert metrics.failed >= 1
+
+    @pytest.mark.asyncio
+    async def test_batch_atomicity_on_failure(self, writer_config: DatabaseWriter, migrated_db: str) -> None:
+        """Test that batch is atomic - one failure rolls back entire batch."""
+        from app.database.config import DBConfig
+        # Use batch_size=3 to force batching
+        config = DBConfig(db_path=migrated_db, queue_size=100, batch_size=3, flush_interval=10.0)
+        writer = DatabaseWriter(db_config=config, queue_size=100, batch_size=3, flush_interval=10.0)
+        writer.start()
+
+        try:
+            # Write 2 valid rows + 1 invalid (FK violation) - all should be in same batch
+            valid1 = await writer.write(
+                "servers",
+                {"id": "atomic-1", "hostname": "atomic-1", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
+            )
+            valid2 = await writer.write(
+                "servers",
+                {"id": "atomic-2", "hostname": "atomic-2", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
+            )
+            invalid = await writer.write(
+                "cpu_samples",
+                {"server_id": "non-existent-server", "timestamp": "2026-01-01T00:00:00Z", "per_core": "[]"},
+            )
+
+            assert valid1 is True
+            assert valid2 is True
+            assert invalid is True  # Enqueue succeeds
+
+            # Wait for batch to process - poll metrics instead of fixed sleep
+            for _ in range(50):
+                metrics = writer.get_metrics()
+                if metrics.failed >= 3 or metrics.successful >= 3:
+                    break
+                await asyncio.sleep(0.05)
+
+            # All three tasks should have failed (batch rolled back)
+            metrics = writer.get_metrics()
+            assert metrics.failed == 3, f"Expected 3 failed, got {metrics.failed}"
+            assert metrics.successful == 0, f"Expected 0 successful (batch rolled back), got {metrics.successful}"
+
+            # Verify NO rows in database (entire batch rolled back)
+            with database_connection(migrated_db) as conn:
+                cursor = conn.execute("SELECT COUNT(*) FROM servers WHERE id LIKE 'atomic-%'")
+                count = cursor.fetchone()[0]
+                assert count == 0, f"Expected 0 rows (batch rolled back), got {count}"
+
+        finally:
+            writer.stop()
 
 
 class TestWriterShutdown:
@@ -448,18 +497,21 @@ class TestWriterThreadSafety:
         """Test that write() returns control to event loop quickly."""
         import time
 
-        # Track if event loop was blocked
+        # Track if event loop was blocked - measure time between yields
         loop_blocked = False
+        last_yield = time.monotonic()
 
         async def monitor_loop() -> None:
-            nonlocal loop_blocked
+            nonlocal loop_blocked, last_yield
             start = time.monotonic()
             while time.monotonic() - start < 1.0:
                 await asyncio.sleep(0.01)
-                if time.monotonic() - start > 0.5:
-                    # If we haven't yielded in 500ms, loop was blocked
+                now = time.monotonic()
+                # If gap between monitor iterations exceeds 500ms, loop was blocked
+                if now - last_yield > 0.5:
                     loop_blocked = True
                     break
+                last_yield = now
 
         # Start monitor
         monitor_task = asyncio.create_task(monitor_loop())
@@ -476,6 +528,73 @@ class TestWriterThreadSafety:
         # Event loop should not have been blocked
         assert loop_blocked is False
 
+    @pytest.mark.asyncio
+    async def test_concurrent_queue_eviction_thread_safe(self, migrated_db: str) -> None:
+        """Test that concurrent priority eviction does not corrupt queue or lose tasks."""
+        from app.database.config import DBConfig
+        config = DBConfig(db_path=migrated_db, queue_size=10, batch_size=5, flush_interval=10.0)
+        writer = DatabaseWriter(db_config=config, queue_size=10, batch_size=5, flush_interval=10.0)
+        writer.start()
+
+        try:
+            # Fill queue with NORMAL priority
+            for i in range(10):
+                result = await writer.write(
+                    "servers",
+                    {"id": f"fill-{i}", "hostname": f"fill-{i}", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
+                    priority=WritePriority.NORMAL,
+                )
+                assert result is True
+
+            # Now fire many HIGH priority writes concurrently - each should evict one item
+            # Use asyncio.gather to create concurrent pressure
+            async def write_high(idx: int) -> bool:
+                return await writer.write(
+                    "servers",
+                    {"id": f"high-{idx}", "hostname": f"high-{idx}", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
+                    priority=WritePriority.HIGH,
+                    timeout=0.5,
+                )
+
+            results = await asyncio.gather(*[write_high(i) for i in range(20)])
+
+            # All HIGH priority writes should succeed (evicting lower priority)
+            assert all(results), f"Some high priority writes failed: {results}"
+
+            # Wait for processing - poll metrics instead of fixed sleep
+            for _ in range(50):
+                metrics = writer.get_metrics()
+                if metrics.dropped >= 20 and metrics.enqueued >= 30:
+                    break
+                await asyncio.sleep(0.05)
+
+            # Verify queue depth is bounded (max 10)
+            assert writer.queue_depth <= 10
+
+            # Verify metrics:
+            # 10 initial enqueued + 20 high = 30 enqueued
+            # First 10 HIGH evict 10 NORMAL (10 dropped)
+            # Next 10 HIGH evict 10 earlier HIGH (10 more dropped) = 20 total dropped
+            metrics = writer.get_metrics()
+            assert metrics.enqueued == 30
+            assert metrics.dropped == 20  # 10 NORMAL + 10 HIGH evicted
+            assert metrics.failed == 0
+
+            # Verify only the last 10 HIGH priority tasks made it to database
+            # (first 10 HIGH were evicted by last 10 HIGH)
+            with database_connection(migrated_db) as conn:
+                cursor = conn.execute("SELECT COUNT(*) FROM servers WHERE id LIKE 'high-%'")
+                count = cursor.fetchone()[0]
+                assert count == 10, f"Expected 10 high priority rows (last batch), got {count}"
+
+                # NORMAL priority should have been evicted (0 remaining)
+                cursor = conn.execute("SELECT COUNT(*) FROM servers WHERE id LIKE 'fill-%'")
+                count = cursor.fetchone()[0]
+                assert count == 0, f"Expected 0 fill rows (all evicted), got {count}"
+
+        finally:
+            writer.stop()
+
 
 class TestWriterIntegration:
     """Integration tests with real database."""
@@ -483,7 +602,7 @@ class TestWriterIntegration:
     @pytest.mark.asyncio
     async def test_write_all_table_types(self, writer_config: DatabaseWriter, migrated_db: str) -> None:
         """Test writing to all table types."""
-        tables_and_data = [
+        tables_and_data: list[tuple[str, dict[str, Any]]] = [
             ("servers", {"id": "int-test", "hostname": "int-test", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"}),
             ("cpu_samples", {"server_id": "int-test", "timestamp": "2026-01-01T00:00:00Z", "total_utilization": 50.0, "per_core": "[50.0]", "load_1min": 1.0, "load_5min": 1.0, "load_15min": 1.0, "cpu_count": 4}),
             ("memory_samples", {"server_id": "int-test", "timestamp": "2026-01-01T00:00:00Z", "total_bytes": 1000000, "available_bytes": 500000, "used_bytes": 500000}),
