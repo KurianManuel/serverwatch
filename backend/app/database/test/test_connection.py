@@ -124,7 +124,7 @@ class TestConnectionBehavior:
     def test_migrations_apply_pragmas(self, temp_db: str) -> None:
         """Verify migrations run with PRAGMAs applied."""
         version = run_migrations(temp_db)
-        assert version == 1
+        assert version == 2
 
         # Verify PRAGMAs still work after migration
         with database_connection(temp_db) as conn:

@@ -1,7 +1,7 @@
 """Database package for ServerWatch."""
 
 from app.database.config import DBConfig, get_db_config
-from app.database.connection import database_connection
+from app.database.connection import _iso_to_unix, database_connection
 from app.database.migrations import MigrationError, run_migrations
 from app.database.rollup import (
     RollupProcessor,
@@ -14,6 +14,7 @@ __all__ = [
     "DBConfig",
     "get_db_config",
     "database_connection",
+    "_iso_to_unix",
     "MigrationError",
     "run_migrations",
     "RollupProcessor",

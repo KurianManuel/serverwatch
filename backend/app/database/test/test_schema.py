@@ -98,7 +98,7 @@ class TestSchemaCreation:
         version1 = run_migrations(migrated_db)
         # Second run
         version2 = run_migrations(migrated_db)
-        assert version1 == version2 == 1
+        assert version1 == version2 == 2
 
 
 class TestSchemaValidation:

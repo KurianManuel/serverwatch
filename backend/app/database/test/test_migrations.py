@@ -2,6 +2,8 @@
 
 import importlib
 import sqlite3
+import tempfile
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -13,38 +15,116 @@ from app.database.migrations import (
     MigrationError,
     _has_application_tables,
     _validate_schema_v1,
+    _validate_schema_v2,
     run_migrations,
 )
+
+
+def _create_v1_database(db_path: str) -> None:
+    """Create a valid version 1 database by running only v1 migration."""
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE TRANSACTION;")
+        for stmt in MIGRATION_0001_STATEMENTS:
+            conn.execute(stmt)
+        conn.execute("COMMIT;")
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    finally:
+        conn.close()
+
+
+def _create_v1_db_with_schema_metadata_v1(db_path: str) -> None:
+    """Create a database with schema_metadata version 1 and all v1 tables."""
+    _create_v1_database(db_path)
+    # Ensure version is set to 1
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        conn.execute("UPDATE schema_metadata SET version = 1")
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def temp_db() -> Generator[str, None, None]:
+    """Create a temporary database file for testing."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    try:
+        yield db_path
+    finally:
+        Path(db_path).unlink(missing_ok=True)
+
+
+@pytest.fixture
+def v1_database(temp_db: str) -> str:
+    """Create a valid version 1 database."""
+    _create_v1_database(temp_db)
+    return temp_db
+
+
+@pytest.fixture
+def v1_database_with_version(temp_db: str) -> str:
+    """Create a v1 database with explicit version 1 in schema_metadata."""
+    _create_v1_database(temp_db)
+    conn = sqlite3.connect(temp_db, isolation_level=None)
+    try:
+        conn.execute("UPDATE schema_metadata SET version = 1")
+    finally:
+        conn.close()
+    return temp_db
+
+
+@pytest.fixture
+def v2_database(temp_db: str) -> str:
+    """Create a valid version 2 database (full migration)."""
+    from app.database.migrations import run_migrations
+    run_migrations(temp_db)
+    return temp_db
+
+
+@pytest.fixture
+def migrated_db(temp_db: str) -> str:
+    """Create a database with migrations applied (latest version)."""
+    from app.database.migrations import run_migrations
+    run_migrations(temp_db)
+    return temp_db
+
+
+# ... existing test classes ...
 
 
 class TestMigrationSuccess:
     """Tests for successful migration scenarios."""
 
     def test_fresh_database_migration_succeeds(self, temp_db: str) -> None:
-        """Migration on fresh database succeeds."""
+        """Migration on fresh database succeeds to version 2."""
         version = run_migrations(temp_db)
         assert version == SUPPORTED_VERSION
+        assert version == 2
 
     def test_version_recorded_after_schema_creation(self, temp_db: str) -> None:
-        """Version 1 is recorded only after all schema statements succeed."""
+        """Version 2 is recorded only after all schema statements succeed."""
         run_migrations(temp_db)
         with database_connection(temp_db) as conn:
             cursor = conn.execute("SELECT version FROM schema_metadata")
             row = cursor.fetchone()
             assert row is not None
-            assert row[0] == 1
+            assert row[0] == 2
 
     def test_idempotent_rerun(self, migrated_db: str) -> None:
-        """Re-running migration on valid v1 database is a no-op."""
+        """Re-running migration on valid v2 database is a no-op."""
         version1 = run_migrations(migrated_db)
         version2 = run_migrations(migrated_db)
         assert version1 == version2 == SUPPORTED_VERSION
 
-    def test_complete_v1_database_noop(self, migrated_db: str) -> None:
-        """Complete version-1 database remains an idempotent no-op."""
-        # Already validated by migrated_db fixture
+    def test_complete_v2_database_noop(self, migrated_db: str) -> None:
+        """Complete version-2 database remains an idempotent no-op."""
         version = run_migrations(migrated_db)
-        assert version == 1
+        assert version == SUPPORTED_VERSION
+        assert version == 2
 
 
 class TestMigrationFailureHandling:
@@ -52,12 +132,12 @@ class TestMigrationFailureHandling:
 
     def test_unsupported_newer_version_rejected(self, temp_db: str) -> None:
         """Database with version > supported is rejected."""
-        # Manually create a schema_metadata with version 2
+        # Manually create a schema_metadata with version 3
         with database_connection(temp_db) as conn:
             conn.execute("CREATE TABLE schema_metadata (version INTEGER PRIMARY KEY, applied_at TIMESTAMP, description TEXT)")
-            conn.execute("INSERT INTO schema_metadata (version, description) VALUES (2, 'Future version')")
+            conn.execute("INSERT INTO schema_metadata (version, description) VALUES (3, 'Future version')")
 
-        with pytest.raises(MigrationError, match="Database version 2 > supported 1"):
+        with pytest.raises(MigrationError, match="Database version 3 > supported 2"):
             run_migrations(temp_db)
 
     def test_pre_existing_tables_without_metadata_rejected(self, temp_db: str) -> None:
@@ -71,24 +151,68 @@ class TestMigrationFailureHandling:
 
     def test_version1_missing_table_rejected(self, temp_db: str) -> None:
         """Version-1 database missing required table is rejected."""
-        # Create schema_metadata with version 1 but incomplete tables
+        # Create a valid v1 database
+        _create_v1_database(temp_db)
+        # Corrupt it by dropping a required table
         with database_connection(temp_db) as conn:
-            conn.execute("CREATE TABLE schema_metadata (version INTEGER PRIMARY KEY, applied_at TIMESTAMP, description TEXT)")
-            conn.execute("INSERT INTO schema_metadata (version, description) VALUES (1, 'Initial schema')")
-            # Only create some tables
-            conn.execute("CREATE TABLE servers (id TEXT PRIMARY KEY)")
+            conn.execute("DROP TABLE cpu_samples")
 
-        with pytest.raises(MigrationError, match="required tables/indexes are missing"):
+        with pytest.raises(MigrationError, match="schema validation failed"):
             run_migrations(temp_db)
 
     def test_version1_missing_index_rejected(self, temp_db: str) -> None:
         """Version-1 database missing required index is rejected."""
-        # Create all tables but skip one index
+        # Create a valid v1 database
+        _create_v1_database(temp_db)
+        # Corrupt it by dropping a required index
         with database_connection(temp_db) as conn:
-            # Run almost all migration statements but skip one index
-            for stmt in MIGRATION_0001_STATEMENTS:
-                if "idx_cpu_samples_server_time" not in stmt:
-                    conn.execute(stmt)
+            conn.execute("DROP INDEX idx_cpu_samples_server_time")
+
+        with pytest.raises(MigrationError, match="schema validation failed"):
+            run_migrations(temp_db)
+
+    def test_version2_missing_table_rejected(self, temp_db: str) -> None:
+        """Version-2 database missing required table is rejected."""
+        # Create a valid v1 database
+        _create_v1_database(temp_db)
+        # Set version to 2 but missing event_deduplication table
+        with database_connection(temp_db) as conn:
+            conn.execute("UPDATE schema_metadata SET version = 2")
+
+        with pytest.raises(MigrationError, match="required tables/indexes are missing"):
+            run_migrations(temp_db)
+
+    def test_version2_missing_deduplication_table_rejected(self, temp_db: str) -> None:
+        """Version-2 database missing event_deduplication table is rejected."""
+        _create_v1_database(temp_db)
+        with database_connection(temp_db) as conn:
+            conn.execute("UPDATE schema_metadata SET version = 2")
+            # Drop the event_deduplication table if it exists
+            conn.execute("DROP TABLE IF EXISTS event_deduplication")
+
+        with pytest.raises(MigrationError, match="required tables/indexes are missing"):
+            run_migrations(temp_db)
+
+    def test_version2_missing_fingerprint_column_rejected(self, temp_db: str) -> None:
+        """Version-2 database missing fingerprint column in events is rejected."""
+        _create_v1_database(temp_db)
+        with database_connection(temp_db) as conn:
+            conn.execute("UPDATE schema_metadata SET version = 2")
+            # Remove fingerprint column from events
+            conn.execute("""
+                CREATE TABLE events_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id TEXT NOT NULL REFERENCES servers(id),
+                    timestamp TIMESTAMP NOT NULL,
+                    event_type TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    source TEXT, title TEXT, message TEXT,
+                    metadata TEXT
+                )
+            """)
+            conn.execute("INSERT INTO events_new SELECT id, server_id, timestamp, event_type, severity, source, title, message, metadata FROM events")
+            conn.execute("DROP TABLE events")
+            conn.execute("ALTER TABLE events_new RENAME TO events")
 
         with pytest.raises(MigrationError, match="required tables/indexes are missing"):
             run_migrations(temp_db)
@@ -104,21 +228,20 @@ class TestTransactionRollback:
         statement after several valid DDL statements. Exercise the real
         migration runner and verify complete rollback.
         """
-        from app.database import migrations as migration_module
 
         # Save original statements
-        original_statements = migration_module.MIGRATION_0001_STATEMENTS
+        original_statements = MIGRATION_0001_STATEMENTS
 
         # Build a modified statement list: first N valid statements, then a syntax error
         # Use first 6 statements (schema_metadata table + servers table + hostname index +
         # cpu_samples table + cpu_samples index + memory_samples table) then inject invalid SQL
-        valid_prefix = original_statements[:6]
+        valid_prefix = MIGRATION_0001_STATEMENTS[:6]
         # Syntax error: missing closing parenthesis
         invalid_stmt = "CREATE TABLE invalid_table (id INTEGER PRIMARY KEY, bad_column THIS_IS_NOT_A_VALID_TYPE;"
-        modified_statements = valid_prefix + [invalid_stmt] + original_statements[6:]
+        modified_statements = valid_prefix + [invalid_stmt] + MIGRATION_0001_STATEMENTS[6:]
 
         # Monkeypatch the module's statement list
-        monkeypatch.setattr(migration_module, 'MIGRATION_0001_STATEMENTS', modified_statements)
+        monkeypatch.setattr('app.database.migrations.MIGRATION_0001_STATEMENTS', modified_statements)
 
         # Run migration through the REAL runner - should fail with SQLite error
         with pytest.raises(sqlite3.OperationalError):
@@ -141,25 +264,25 @@ class TestTransactionRollback:
             assert cursor.fetchone() is None, "schema_metadata table should not exist after rollback"
 
         # Restore original statements
-        monkeypatch.setattr(migration_module, 'MIGRATION_0001_STATEMENTS', original_statements)
+        monkeypatch.setattr('app.database.migrations.MIGRATION_0001_STATEMENTS', original_statements)
 
         # Second attempt: normal migration should succeed completely
         version = run_migrations(temp_db)
         assert version == SUPPORTED_VERSION
 
-        # Verify 10 application tables + schema_metadata = 11 tables exist
-        # (sqlite_sequence makes 12 total in sqlite_master)
+        # Verify all 10 application tables + schema_metadata + event_deduplication = 12 tables
+        # (sqlite_sequence makes 13 total in sqlite_master)
         with database_connection(temp_db) as conn:
             cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = {row[0] for row in cursor.fetchall()}
             required_tables = {
                 "servers", "cpu_samples", "memory_samples", "disk_samples",
                 "network_samples", "filesystem_samples", "temperature_samples",
-                "events", "alerts", "metric_rollups", "schema_metadata"
+                "events", "alerts", "metric_rollups", "schema_metadata", "event_deduplication"
             }
             assert required_tables.issubset(tables), f"Missing tables: {required_tables - tables}"
 
-            # Verify all 20 indexes exist
+            # Verify all 22 indexes exist (20 v1 + 2 v2)
             cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")
             indexes = {row[0] for row in cursor.fetchall()}
             required_indexes = {
@@ -173,25 +296,23 @@ class TestTransactionRollback:
                 "idx_events_server_time", "idx_events_type", "idx_events_severity",
                 "idx_alerts_server_time", "idx_alerts_state", "idx_alerts_rule",
                 "idx_rollups_server_metric_time", "idx_rollups_interval", "idx_rollups_unique",
+                "idx_events_fingerprint", "idx_event_deduplication_created",
             }
             assert required_indexes.issubset(indexes), f"Missing indexes: {required_indexes - indexes}"
 
-            # Verify schema version is 1
+            # Verify schema version is 2
             cursor = conn.execute("SELECT version FROM schema_metadata")
-            assert cursor.fetchone()[0] == 1
+            assert cursor.fetchone()[0] == 2
 
     def test_retry_after_rollback_succeeds(self, temp_db: str, monkeypatch: pytest.MonkeyPatch) -> None:
         """After a rollback, retrying migration succeeds (separate verification)."""
-        from app.database import migrations as migration_module
-
         # Use a different failure point to test retry scenario independently
-        original_statements = migration_module.MIGRATION_0001_STATEMENTS
-        valid_prefix = original_statements[:3]  # schema_metadata, servers, servers index
-        # Syntax error: missing closing parenthesis
-        invalid_stmt = "CREATE TABLE another_invalid (x BADTYPE;"
-        modified_statements = valid_prefix + [invalid_stmt] + original_statements[3:]
+        valid_prefix = MIGRATION_0001_STATEMENTS[:3]  # schema_metadata, servers, servers index
 
-        monkeypatch.setattr(migration_module, 'MIGRATION_0001_STATEMENTS', modified_statements)
+        monkeypatch.setattr(
+            'app.database.migrations.MIGRATION_0001_STATEMENTS',
+            valid_prefix + ["CREATE TABLE another_invalid (x BADTYPE;"] + MIGRATION_0001_STATEMENTS[3:]
+        )
 
         # First attempt: should fail and rollback
         with pytest.raises(sqlite3.OperationalError):
@@ -204,7 +325,7 @@ class TestTransactionRollback:
             assert tables == set()
 
         # Restore and retry
-        monkeypatch.setattr(migration_module, 'MIGRATION_0001_STATEMENTS', original_statements)
+        monkeypatch.setattr('app.database.migrations.MIGRATION_0001_STATEMENTS', MIGRATION_0001_STATEMENTS)
         version = run_migrations(temp_db)
         assert version == SUPPORTED_VERSION
 
@@ -216,7 +337,7 @@ class TestTransactionRollback:
             assert "cpu_samples" in tables
             assert "schema_metadata" in tables
             cursor = conn.execute("SELECT version FROM schema_metadata")
-            assert cursor.fetchone()[0] == 1
+            assert cursor.fetchone()[0] == 2
 
 
 class TestMigrationValidation:
@@ -244,6 +365,42 @@ class TestMigrationValidation:
             conn.execute("CREATE TABLE servers (id TEXT PRIMARY KEY, hostname TEXT)")
             assert _validate_schema_v1(conn) is False
 
+    def test_validate_schema_v2_passes(self, migrated_db: str) -> None:
+        """_validate_schema_v2 returns True for complete v2 schema."""
+        with database_connection(migrated_db) as conn:
+            assert _validate_schema_v2(conn) is True
+
+    def test_validate_schema_v2_fails_missing_dedup_table(self, temp_db: str) -> None:
+        """_validate_schema_v2 returns False when event_deduplication table is missing."""
+        _create_v1_database(temp_db)
+        with database_connection(temp_db) as conn:
+            conn.execute("INSERT INTO schema_metadata (version, description) VALUES (2, 'test')")
+            assert _validate_schema_v2(conn) is False
+
+    def test_validate_schema_v2_fails_missing_fingerprint_column(self, temp_db: str) -> None:
+        """_validate_schema_v2 returns False when fingerprint column is missing from events."""
+        _create_v1_database(temp_db)
+        with database_connection(temp_db) as conn:
+            conn.execute("UPDATE schema_metadata SET version = 2")
+            # Remove fingerprint column from events
+            conn.execute("""
+                CREATE TABLE events_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id TEXT NOT NULL REFERENCES servers(id),
+                    timestamp TIMESTAMP NOT NULL,
+                    event_type TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    source TEXT, title TEXT, message TEXT,
+                    metadata TEXT
+                )
+            """)
+            conn.execute("INSERT INTO events_new SELECT id, server_id, timestamp, event_type, severity, source, title, message, metadata FROM events")
+            conn.execute("DROP TABLE events")
+            conn.execute("ALTER TABLE events_new RENAME TO events")
+
+        with database_connection(temp_db) as conn:
+            assert _validate_schema_v2(conn) is False
+
     def test_has_application_tables(self, temp_db: str) -> None:
         """_has_application_tables detects ServerWatch tables."""
         with database_connection(temp_db) as conn:
@@ -269,13 +426,13 @@ class TestMigrationIdempotence:
         run_migrations(temp_db)
 
         with database_connection(temp_db) as conn:
-            # Count tables created (10 application tables + schema_metadata = 11,
-            # plus sqlite_sequence internal table = 12)
+            # Count tables created (11 application tables + schema_metadata = 12,
+            # plus sqlite_sequence internal table = 13)
             cursor = conn.execute(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
             )
             table_count = cursor.fetchone()[0]
-            assert table_count == 12
+            assert table_count == 13  # 12 application tables + sqlite_sequence
 
     def test_no_duplicate_schema_metadata_on_rerun(self, migrated_db: str) -> None:
         """Re-running doesn't create duplicate schema_metadata entries."""
@@ -286,11 +443,11 @@ class TestMigrationIdempotence:
             cursor = conn.execute("SELECT COUNT(*) FROM schema_metadata")
             assert cursor.fetchone()[0] == 1
 
-    def test_version_remains_1_after_rerun(self, migrated_db: str) -> None:
-        """Version stays at 1 after multiple runs."""
+    def test_version_remains_2_after_rerun(self, migrated_db: str) -> None:
+        """Version stays at 2 after multiple runs."""
         for _ in range(5):
             version = run_migrations(migrated_db)
-            assert version == 1
+            assert version == 2
 
 
 class TestMigrationEdgeCases:
@@ -322,7 +479,7 @@ class TestMigrationEdgeCases:
         from app.database.connection import database_connection
         with database_connection(db_path) as conn:
             cursor = conn.execute("SELECT version FROM schema_metadata")
-            assert cursor.fetchone()[0] == 1
+            assert cursor.fetchone()[0] == 2
 
     def test_database_creation_creates_parent_directories(self, tmp_path: Path) -> None:
         """database_connection creates parent directories if they don't exist."""
@@ -343,11 +500,3 @@ class TestMigrationEdgeCases:
         with database_connection(str(db_path)) as conn:
             cursor = conn.execute("SELECT COUNT(*) FROM test")
             assert cursor.fetchone()[0] == 0
-
-    def test_migration_error_inherits_exception(self) -> None:
-        """MigrationError is an Exception."""
-        assert issubclass(MigrationError, Exception)
-
-    def test_supported_version_is_1(self) -> None:
-        """SUPPORTED_VERSION constant is 1."""
-        assert SUPPORTED_VERSION == 1

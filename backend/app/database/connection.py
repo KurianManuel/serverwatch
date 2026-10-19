@@ -3,9 +3,18 @@
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 from app.database.config import DBConfig, get_db_config
+
+
+def _iso_to_unix(ts_str: str) -> int:
+    """Convert ISO timestamp string to Unix timestamp (seconds)."""
+    # Handle "2026-10-18T10:00:00Z" or "2026-10-18T10:00:00.123Z" or "2026-10-18T10:00:00+00:00"
+    ts_str = ts_str.replace("Z", "+00:00")
+    dt = datetime.fromisoformat(ts_str)
+    return int(dt.timestamp())
 
 
 def _apply_pragmas(conn: sqlite3.Connection) -> None:
@@ -38,6 +47,8 @@ def database_connection(db_path: str | None = None) -> Iterator[sqlite3.Connecti
     conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     _apply_pragmas(conn)
+    # Register helper functions
+    conn.create_function("_iso_to_unix", 1, _iso_to_unix)
     try:
         yield conn
     finally:

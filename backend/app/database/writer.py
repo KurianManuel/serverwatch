@@ -62,7 +62,7 @@ VALID_COLUMNS = {
     },
     "events": {
         "id", "server_id", "timestamp", "event_type", "severity", "source",
-        "title", "message", "metadata"
+        "title", "message", "metadata", "fingerprint"
     },
     "alerts": {
         "id", "server_id", "rule_id", "state", "severity", "condition",
