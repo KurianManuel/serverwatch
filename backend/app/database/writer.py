@@ -28,11 +28,11 @@ VALID_TABLES = {
 }
 
 # Valid columns per table (for validation)
+# MUST match the schema in migrations.py exactly
 VALID_COLUMNS = {
     "servers": {
         "id", "hostname", "display_name", "os_name", "os_version",
-        "kernel_version", "architecture", "tailscale_ip", "last_seen",
-        "created_at", "updated_at"
+        "kernel_version", "architecture", "created_at", "updated_at"
     },
     "cpu_samples": {
         "id", "server_id", "timestamp", "total_utilization", "per_core",
@@ -40,25 +40,25 @@ VALID_COLUMNS = {
     },
     "memory_samples": {
         "id", "server_id", "timestamp", "total_bytes", "available_bytes",
-        "used_bytes", "free_bytes", "cached_bytes", "swap_total_bytes",
-        "swap_used_bytes"
+        "used_bytes", "free_bytes", "buffers_bytes", "cached_bytes",
+        "swap_total_bytes", "swap_used_bytes", "swap_free_bytes"
     },
     "disk_samples": {
         "id", "server_id", "timestamp", "device", "read_bytes", "write_bytes",
-        "read_ops", "write_ops", "read_time_ms", "write_time_ms"
+        "read_ops", "write_ops", "read_throughput", "write_throughput", "iops"
     },
     "network_samples": {
         "id", "server_id", "timestamp", "interface", "rx_bytes", "tx_bytes",
-        "rx_packets", "tx_packets", "rx_errors", "tx_errors", "rx_dropped", "tx_dropped"
+        "rx_packets", "tx_packets", "rx_errors", "tx_errors", "rx_drops", "tx_drops"
     },
     "filesystem_samples": {
         "id", "server_id", "timestamp", "mount_point", "device", "fstype",
         "total_bytes", "free_bytes", "available_bytes", "used_bytes",
-        "inodes_total", "inodes_free"
+        "used_percent", "inodes_total", "inodes_free"
     },
     "temperature_samples": {
-        "id", "server_id", "timestamp", "sensor_name", "temperature_celsius",
-        "sensor_type", "is_critical"
+        "id", "server_id", "timestamp", "sensor_name", "sensor_label",
+        "temperature_celsius", "high_threshold", "critical_threshold"
     },
     "events": {
         "id", "server_id", "timestamp", "event_type", "severity", "source",
@@ -71,8 +71,7 @@ VALID_COLUMNS = {
     },
     "metric_rollups": {
         "id", "server_id", "metric_name", "interval_type", "window_start",
-        "window_end", "count", "min_value", "avg_value", "max_value",
-        "sum_value", "std_dev"
+        "window_end", "count", "min_value", "avg_value", "max_value"
     },
 }
 
@@ -194,7 +193,7 @@ class DatabaseWriter:
         data: dict[str, Any],
         priority: WritePriority = WritePriority.NORMAL,
         timeout: float = 1.0,
-    ) -> bool:
+    ) -> tuple[bool, asyncio.Future[bool]]:
         """
         Enqueue a write task.
 
@@ -205,11 +204,15 @@ class DatabaseWriter:
             timeout: Maximum time to wait for queue space (not used, kept for API compatibility).
 
         Returns:
-            True if enqueued successfully, False if queue full or writer stopped.
+            Tuple of (enqueued: bool, future: asyncio.Future[bool]).
+            enqueued is True if enqueued successfully, False if queue full or writer stopped.
+            future resolves to True if the write commits, False if it fails or is rolled back.
             Write failures are recorded in metrics, not returned here.
         """
         if not self._running:
-            return False
+            fut = self._loop.create_future() if self._loop else asyncio.get_running_loop().create_future()
+            fut.set_result(False)
+            return False, fut
 
         # Capture event loop on first write
         if self._loop is None:
@@ -218,7 +221,9 @@ class DatabaseWriter:
         # Validate table and columns
         if not self._validate_table_and_columns(table, data):
             self._record_drop()
-            return False
+            fut = self._loop.create_future()
+            fut.set_result(False)
+            return False, fut
 
         task = WriteTask(
             priority=priority,
@@ -235,10 +240,10 @@ class DatabaseWriter:
             self._record_drop()
             if task.future and not task.future.done():
                 task.future.set_result(False)
-            return False
+            return False, task.future  # type: ignore[return-value]
 
         self._record_enqueued()
-        return True
+        return True, task.future  # type: ignore[return-value]
 
     def _validate_table_and_columns(self, table: str, data: dict[str, Any]) -> bool:
         """Validate table name and column names against allowlist."""
@@ -455,7 +460,11 @@ class DatabaseWriter:
         columns = ", ".join(data.keys())
         placeholders = ", ".join("?" * len(data))
         values = tuple(data.values())
-        conn.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", values)
+        # Use INSERT OR REPLACE for metric_rollups to handle idempotency
+        if table == "metric_rollups":
+            conn.execute(f"INSERT OR REPLACE INTO {table} ({columns}) VALUES ({placeholders})", values)
+        else:
+            conn.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", values)
 
 
 # Global writer instance (lazy initialization)

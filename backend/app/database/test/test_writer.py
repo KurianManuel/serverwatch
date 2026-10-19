@@ -65,7 +65,7 @@ class TestWriterBasicOperation:
     @pytest.mark.asyncio
     async def test_write_single_row(self, writer_config: DatabaseWriter, migrated_db: str) -> None:
         """Test writing a single row and reading it back."""
-        result = await writer_config.write(
+        enqueued, _ = await writer_config.write(
             "servers",
             {
                 "id": "test-server-1",
@@ -78,7 +78,7 @@ class TestWriterBasicOperation:
             },
             priority=WritePriority.NORMAL,
         )
-        assert result is True
+        assert enqueued is True
 
         # Wait for flush
         await asyncio.sleep(0.2)
@@ -98,7 +98,7 @@ class TestWriterBasicOperation:
 
         # Write multiple rows
         for sid in server_ids:
-            result = await writer_config.write(
+            enqueued, _ = await writer_config.write(
                 "servers",
                 {
                     "id": sid,
@@ -110,7 +110,7 @@ class TestWriterBasicOperation:
                     "architecture": "x86_64",
                 },
             )
-            assert result is True
+            assert enqueued is True
 
         # Wait for all batches to flush
         await asyncio.sleep(0.5)
@@ -177,30 +177,30 @@ class TestWriterQueueSaturation:
         try:
             # Fill the queue completely
             for i in range(5):
-                result = await writer.write(
+                enqueued, _ = await writer.write(
                     "servers",
                     {"id": f"fill-{i}", "hostname": f"fill-{i}", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
                     priority=WritePriority.NORMAL,
                 )
-                assert result is True
+                assert enqueued is True
 
             # Next normal priority should be rejected (queue full)
-            result = await writer.write(
+            enqueued, _ = await writer.write(
                 "servers",
                 {"id": "rejected", "hostname": "rejected", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
                 priority=WritePriority.NORMAL,
                 timeout=0.1,
             )
-            assert result is False
+            assert enqueued is False
 
             # But HIGH priority should be accepted (evicts lowest)
-            result = await writer.write(
+            enqueued, _ = await writer.write(
                 "servers",
                 {"id": "high-evict", "hostname": "high-evict", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
                 priority=WritePriority.HIGH,
                 timeout=0.1,
             )
-            assert result is True
+            assert enqueued is True
 
         finally:
             writer.stop()
@@ -216,16 +216,17 @@ class TestWriterQueueSaturation:
         try:
             # Fill queue
             for i in range(3):
-                await writer.write("servers", {"id": f"fill-{i}", "hostname": f"fill-{i}", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"})
+                enqueued, _ = await writer.write("servers", {"id": f"fill-{i}", "hostname": f"fill-{i}", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"})
+                assert enqueued is True
 
             # Try to write more - should be dropped
             for i in range(3):
-                result = await writer.write(
+                enqueued, _ = await writer.write(
                     "servers",
                     {"id": f"drop-{i}", "hostname": f"drop-{i}", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
                     timeout=0.05,
                 )
-                assert result is False
+                assert enqueued is False
 
             metrics = writer.get_metrics()
             assert metrics.dropped >= 3
@@ -241,7 +242,7 @@ class TestWriterFailureHandling:
     async def test_foreign_key_failure_handled(self, writer_config: DatabaseWriter, migrated_db: str) -> None:
         """Test that FK violations are handled gracefully."""
         # Try to insert with non-existent server_id
-        result = await writer_config.write(
+        enqueued, _ = await writer_config.write(
             "cpu_samples",
             {
                 "server_id": "non-existent-server",
@@ -251,7 +252,7 @@ class TestWriterFailureHandling:
             priority=WritePriority.NORMAL,
         )
         # Enqueue succeeds, but write fails
-        assert result is True  # Enqueue succeeded
+        assert enqueued is True  # Enqueue succeeded
 
         # Wait for processing
         await asyncio.sleep(0.3)
@@ -264,13 +265,13 @@ class TestWriterFailureHandling:
     @pytest.mark.asyncio
     async def test_invalid_table_failure_handled(self, writer_config: DatabaseWriter) -> None:
         """Test that invalid table names are rejected at enqueue time."""
-        result = await writer_config.write(
+        enqueued, _ = await writer_config.write(
             "non_existent_table",
             {"id": "test"},
             priority=WritePriority.NORMAL,
         )
         # Invalid table is rejected at enqueue time (validation)
-        assert result is False
+        assert enqueued is False
 
         # Should be counted as dropped
         metrics = writer_config.get_metrics()
@@ -280,12 +281,12 @@ class TestWriterFailureHandling:
     async def test_malformed_data_failure_handled(self, writer_config: DatabaseWriter) -> None:
         """Test that malformed data (missing required fields) is handled."""
         # servers table requires id and hostname NOT NULL
-        result = await writer_config.write(
+        enqueued, _ = await writer_config.write(
             "servers",
             {"display_name": "Test"},  # missing required fields
             priority=WritePriority.NORMAL,
         )
-        assert result is True
+        assert enqueued is True
 
         await asyncio.sleep(0.3)
 
@@ -303,22 +304,22 @@ class TestWriterFailureHandling:
 
         try:
             # Write 2 valid rows + 1 invalid (FK violation) - all should be in same batch
-            valid1 = await writer.write(
+            valid1_enq, _ = await writer.write(
                 "servers",
                 {"id": "atomic-1", "hostname": "atomic-1", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
             )
-            valid2 = await writer.write(
+            valid2_enq, _ = await writer.write(
                 "servers",
                 {"id": "atomic-2", "hostname": "atomic-2", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
             )
-            invalid = await writer.write(
+            invalid_enq, _ = await writer.write(
                 "cpu_samples",
                 {"server_id": "non-existent-server", "timestamp": "2026-01-01T00:00:00Z", "per_core": "[]"},
             )
 
-            assert valid1 is True
-            assert valid2 is True
-            assert invalid is True  # Enqueue succeeds
+            assert valid1_enq is True
+            assert valid2_enq is True
+            assert invalid_enq is True  # Enqueue succeeds
 
             # Wait for batch to process - poll metrics instead of fixed sleep
             for _ in range(50):
@@ -539,22 +540,23 @@ class TestWriterThreadSafety:
         try:
             # Fill queue with NORMAL priority
             for i in range(10):
-                result = await writer.write(
+                enqueued, _ = await writer.write(
                     "servers",
                     {"id": f"fill-{i}", "hostname": f"fill-{i}", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
                     priority=WritePriority.NORMAL,
                 )
-                assert result is True
+                assert enqueued is True
 
             # Now fire many HIGH priority writes concurrently - each should evict one item
             # Use asyncio.gather to create concurrent pressure
             async def write_high(idx: int) -> bool:
-                return await writer.write(
+                enqueued, _ = await writer.write(
                     "servers",
                     {"id": f"high-{idx}", "hostname": f"high-{idx}", "os_name": "Linux", "os_version": "6.1", "kernel_version": "6.1", "architecture": "x86_64"},
                     priority=WritePriority.HIGH,
                     timeout=0.5,
                 )
+                return enqueued
 
             results = await asyncio.gather(*[write_high(i) for i in range(20)])
 
@@ -616,8 +618,8 @@ class TestWriterIntegration:
         ]
 
         for table, data in tables_and_data:
-            result = await writer_config.write(table, data, priority=WritePriority.NORMAL)
-            assert result is True, f"Failed to enqueue write to {table}"
+            enqueued, _ = await writer_config.write(table, data, priority=WritePriority.NORMAL)
+            assert enqueued is True, f"Failed to enqueue write to {table}"
 
         await asyncio.sleep(0.5)
 
