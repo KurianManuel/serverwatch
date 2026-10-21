@@ -1,6 +1,7 @@
 """Events package."""
 
 from app.events.engine import EventEngine
+from app.events.journal import JournalReader, get_journal_reader, start_journal_reader, stop_journal_reader
 from app.events.models import (
     Event,
     EventCreate,
@@ -28,4 +29,8 @@ __all__ = [
     "compute_fingerprint",
     "EventRepository",
     "EventEngine",
+    "JournalReader",
+    "get_journal_reader",
+    "start_journal_reader",
+    "stop_journal_reader",
 ]
