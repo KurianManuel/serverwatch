@@ -5,7 +5,7 @@ import sqlite3
 from app.database.connection import database_connection
 
 # Current supported schema version
-SUPPORTED_VERSION = 2
+SUPPORTED_VERSION = 3
 
 
 class MigrationError(Exception):
@@ -187,6 +187,24 @@ MIGRATION_0002_STATEMENTS_VERSION = [
 ]
 
 
+# Version 3: Add journal_cursor table for durable journal cursor checkpointing
+MIGRATION_0003_STATEMENTS_DDL = [
+    # Create journal_cursor table for durable cursor checkpointing (idempotent)
+    """CREATE TABLE IF NOT EXISTS journal_cursor (
+        server_id TEXT NOT NULL,
+        cursor TEXT NOT NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (server_id)
+    )""",
+]
+
+MIGRATION_0003_STATEMENTS_VERSION = [
+    # Update version record LAST - only if all above succeeded
+    """DELETE FROM schema_metadata WHERE version = 2""",
+    """INSERT INTO schema_metadata (version, description) VALUES (3, 'Add journal_cursor table for durable journal cursor checkpointing')""",
+]
+
+
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     """Check if a table exists in the database."""
     cursor = conn.execute(
@@ -254,6 +272,15 @@ def _validate_schema_v2(conn: sqlite3.Connection) -> bool:
     return required_tables.issubset(tables) and required_indexes.issubset(indexes)
 
 
+def _validate_schema_v3(conn: sqlite3.Connection) -> bool:
+    """Verify all Phase 5.2 required tables and indexes exist."""
+    required_tables = {"journal_cursor"}
+
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+    return required_tables.issubset(tables)
+
+
 def _apply_initial_migration_transactional(conn: sqlite3.Connection) -> int:
     """Apply 0001 migration in a single explicit transaction."""
     conn.execute("BEGIN IMMEDIATE TRANSACTION;")
@@ -283,6 +310,22 @@ def _apply_migration_transactional(conn: sqlite3.Connection, version: int) -> No
         conn.execute("BEGIN IMMEDIATE TRANSACTION;")
         try:
             for stmt in MIGRATION_0002_STATEMENTS_VERSION:
+                conn.execute(stmt)
+            conn.execute("COMMIT;")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK;")
+            except sqlite3.OperationalError:
+                pass  # No transaction to roll back
+            raise
+    elif version == 3:
+        # DDL statements (CREATE TABLE) implicitly commit in SQLite
+        for stmt in MIGRATION_0003_STATEMENTS_DDL:
+            conn.execute(stmt)
+        # Then update version in a separate transaction
+        conn.execute("BEGIN IMMEDIATE TRANSACTION;")
+        try:
+            for stmt in MIGRATION_0003_STATEMENTS_VERSION:
                 conn.execute(stmt)
             conn.execute("COMMIT;")
         except Exception:
@@ -338,11 +381,18 @@ def run_migrations(db_path: str | None = None) -> int:
                         "Database reports version 1 but required tables/indexes are missing. "
                         "Manual intervention required."
                     )
-            elif SUPPORTED_VERSION >= 2:
+            elif SUPPORTED_VERSION == 2:
                 # For v2+, validate both v1 and v2 schemas
                 if not _validate_schema_v1(conn) or not _validate_schema_v2(conn):
                     raise MigrationError(
                         "Database reports version 2 but required tables/indexes are missing. "
+                        "Manual intervention required."
+                    )
+            elif SUPPORTED_VERSION >= 3:
+                # For v3+, validate v1, v2, and v3 schemas
+                if not _validate_schema_v1(conn) or not _validate_schema_v2(conn) or not _validate_schema_v3(conn):
+                    raise MigrationError(
+                        "Database reports version 3 but required tables/indexes are missing. "
                         "Manual intervention required."
                     )
             return current
@@ -355,9 +405,13 @@ def run_migrations(db_path: str | None = None) -> int:
         if SUPPORTED_VERSION == 1:
             if not _validate_schema_v1(conn):
                 raise MigrationError("Migration completed but schema validation failed.")
-        elif SUPPORTED_VERSION >= 2:
+        elif SUPPORTED_VERSION == 2:
             # For v2+, validate both v1 and v2 schemas
             if not _validate_schema_v1(conn) or not _validate_schema_v2(conn):
+                raise MigrationError("Migration completed but schema validation failed.")
+        elif SUPPORTED_VERSION >= 3:
+            # For v3+, validate v1, v2, and v3 schemas
+            if not _validate_schema_v1(conn) or not _validate_schema_v2(conn) or not _validate_schema_v3(conn):
                 raise MigrationError("Migration completed but schema validation failed.")
 
         return SUPPORTED_VERSION

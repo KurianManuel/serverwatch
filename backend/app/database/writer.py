@@ -5,6 +5,7 @@ import queue
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
@@ -101,6 +102,25 @@ class WriteTask:
         self.sort_key = (-self.priority.value, self.sequence)
 
 
+@dataclass(order=True)
+class AtomicWriteTask:
+    """An atomic database transaction task.
+
+    Executes a custom callable in a single transaction on the writer thread.
+    Used for operations requiring atomicity across multiple statements
+    (e.g., event insert + deduplication record).
+    """
+    priority: WritePriority
+    sequence: int
+    func: Callable[[sqlite3.Connection], Any]
+    future: asyncio.Future[Any] | None = field(default=None, compare=False)
+    timestamp: datetime = field(default_factory=datetime.utcnow, compare=False)
+    sort_key: tuple[int, int] = field(init=False, compare=True)
+
+    def __post_init__(self) -> None:
+        self.sort_key = (-self.priority.value, self.sequence)
+
+
 @dataclass
 class WriterMetrics:
     """Runtime metrics for the database writer."""
@@ -133,7 +153,7 @@ class DatabaseWriter:
         shutdown_drain_timeout: float = 5.0,
     ) -> None:
         self._db_config = db_config or get_db_config()
-        self._queue: queue.PriorityQueue[WriteTask] = queue.PriorityQueue(maxsize=queue_size)
+        self._queue: queue.PriorityQueue[WriteTask | AtomicWriteTask] = queue.PriorityQueue(maxsize=queue_size)
         self._batch_size = batch_size
         self._flush_interval = flush_interval
         self._shutdown_drain_timeout = shutdown_drain_timeout
@@ -245,6 +265,52 @@ class DatabaseWriter:
         self._record_enqueued()
         return True, task.future  # type: ignore[return-value]
 
+    async def execute_atomic(
+        self,
+        func: Callable[[sqlite3.Connection], Any],
+        priority: WritePriority = WritePriority.HIGH,
+        timeout: float = 1.0,
+    ) -> tuple[bool, asyncio.Future[Any]]:
+        """
+        Execute a custom atomic transaction on the writer thread.
+
+        Args:
+            func: Callable that takes a sqlite3.Connection and returns a result.
+                  Executed in a single transaction (BEGIN IMMEDIATE / COMMIT).
+            priority: Write priority for queue ordering.
+            timeout: Maximum time to wait for queue space (kept for API compatibility).
+
+        Returns:
+            Tuple of (enqueued: bool, future: asyncio.Future[Any]).
+            enqueued is True if enqueued successfully, False if queue full or writer stopped.
+            future resolves to the function's return value on commit, or False on failure/rollback.
+        """
+        if not self._running:
+            fut = self._loop.create_future() if self._loop else asyncio.get_running_loop().create_future()
+            fut.set_result(False)
+            return False, fut
+
+        if self._loop is None:
+            self._loop = asyncio.get_running_loop()
+
+        task = AtomicWriteTask(
+            priority=priority,
+            sequence=self._next_sequence(),
+            func=func,
+            future=self._loop.create_future(),
+        )
+
+        try:
+            self._enqueue_task(task)
+        except queue.Full:
+            self._record_drop()
+            if task.future and not task.future.done():
+                task.future.set_result(False)
+            return False, task.future  # type: ignore[return-value]
+
+        self._record_enqueued()
+        return True, task.future  # type: ignore[return-value]
+
     def _validate_table_and_columns(self, table: str, data: dict[str, Any]) -> bool:
         """Validate table name and column names against allowlist."""
         if table not in VALID_TABLES:
@@ -255,7 +321,7 @@ class DatabaseWriter:
                 return False
         return True
 
-    def _enqueue_task(self, task: WriteTask) -> None:
+    def _enqueue_task(self, task: WriteTask | AtomicWriteTask) -> None:
         """Enqueue task with priority-based eviction when full."""
         # Fast path: try non-blocking put
         try:
@@ -279,7 +345,7 @@ class DatabaseWriter:
 
             # Priority queue doesn't support direct inspection of lowest priority item.
             # Drain queue, remove lowest priority, re-insert remaining + new task.
-            items: list[WriteTask] = []
+            items: list[WriteTask | AtomicWriteTask] = []
             while not self._queue.empty():
                 try:
                     items.append(self._queue.get_nowait())
@@ -380,37 +446,55 @@ class DatabaseWriter:
             if self._shutdown_event.is_set() and self._queue.empty():
                 break
 
-            # Collect batch
-            batch = self._collect_batch()
-            if not batch:
+            # Get next task (blocks briefly)
+            task = self._get_next_task()
+            if task is None:
                 # No work available, wait briefly
                 time.sleep(min(0.1, self._flush_interval))
                 continue
 
-            # Process batch
-            self._flush_batch(conn, batch)
+            if isinstance(task, AtomicWriteTask):
+                # Execute atomic task in its own transaction
+                self._execute_atomic(conn, task)
+            else:
+                # Collect batch of regular write tasks
+                batch = [task] + self._collect_write_tasks()
+                self._flush_batch(conn, batch)
 
             # Periodic flush even if batch not full
             now = time.monotonic()
             if now - last_flush >= self._flush_interval:
                 last_flush = now
 
-    def _collect_batch(self) -> list[WriteTask]:
-        """Collect up to batch_size tasks from the queue.
+    def _get_next_task(self) -> WriteTask | AtomicWriteTask | None:
+        """Get the next task from the queue with short timeout."""
+        deadline = time.monotonic() + min(0.1, self._flush_interval)
+        while time.monotonic() < deadline:
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                return self._queue.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                break
+        return None
 
-        Acquires _queue_lock to synchronize with eviction logic.
-        """
+    def _collect_write_tasks(self) -> list[WriteTask]:
+        """Collect additional write tasks for batching (excludes atomic tasks)."""
         batch: list[WriteTask] = []
         deadline = time.monotonic() + self._flush_interval
 
         with self._queue_lock:
-            while len(batch) < self._batch_size:
+            while len(batch) < self._batch_size - 1:  # -1 because we already have one
                 try:
-                    # Non-blocking get with short timeout to check shutdown
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
                     task = self._queue.get(timeout=min(0.1, remaining))
+                    if isinstance(task, AtomicWriteTask):
+                        # Put atomic task back - it needs its own transaction
+                        self._queue.put_nowait(task)
+                        break
                     batch.append(task)
                 except queue.Empty:
                     break
@@ -448,6 +532,28 @@ class DatabaseWriter:
                 self._record_failure(error_msg)
             for task in batch:
                 self._resolve_future(task, False)
+
+    def _execute_atomic(self, conn: sqlite3.Connection, task: AtomicWriteTask) -> None:
+        """Execute an atomic transaction task in its own transaction."""
+        try:
+            conn.execute("BEGIN IMMEDIATE TRANSACTION;")
+            result = task.func(conn)
+            conn.execute("COMMIT;")
+            self._resolve_atomic_future(task, result)
+            self._record_success()
+        except Exception as e:
+            try:
+                conn.execute("ROLLBACK;")
+            except sqlite3.OperationalError:
+                pass
+            error_msg = f"Atomic transaction failed: {e}"
+            self._record_failure(error_msg)
+            self._resolve_atomic_future(task, False)
+
+    def _resolve_atomic_future(self, task: AtomicWriteTask, result: Any) -> None:
+        """Thread-safely resolve the atomic task's future."""
+        if task.future and not task.future.done() and self._loop:
+            self._loop.call_soon_threadsafe(task.future.set_result, result)
 
     def _resolve_future(self, task: WriteTask, result: bool) -> None:
         """Thread-safely resolve the task's future."""
