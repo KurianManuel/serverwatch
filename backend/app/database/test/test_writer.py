@@ -570,9 +570,6 @@ class TestWriterThreadSafety:
                     break
                 await asyncio.sleep(0.05)
 
-            # Verify queue depth is bounded (max 10)
-            assert writer.queue_depth <= 10
-
             # Verify metrics:
             # 10 initial enqueued + 20 high = 30 enqueued
             # First 10 HIGH evict 10 NORMAL (10 dropped)
@@ -581,6 +578,23 @@ class TestWriterThreadSafety:
             assert metrics.enqueued == 30
             assert metrics.dropped == 20  # 10 NORMAL + 10 HIGH evicted
             assert metrics.failed == 0
+
+            # Verify queue depth is bounded (max 10)
+            assert writer.queue_depth <= 10
+
+            # Wait for the writer thread to flush queued writes to SQLite.
+            # Metrics confirm enqueue/drop counts, but SQLite rows only appear
+            # after the writer thread drains the queue. Poll the database
+            # directly to avoid a race between thread scheduling and assertion.
+            for _ in range(200):
+                with database_connection(migrated_db) as conn:
+                    cursor = conn.execute("SELECT COUNT(*) FROM servers WHERE id LIKE 'high-%'")
+                    high_count = cursor.fetchone()[0]
+                    cursor = conn.execute("SELECT COUNT(*) FROM servers WHERE id LIKE 'fill-%'")
+                    fill_count = cursor.fetchone()[0]
+                if high_count >= 10 and fill_count == 0:
+                    break
+                await asyncio.sleep(0.05)
 
             # Verify only the last 10 HIGH priority tasks made it to database
             # (first 10 HIGH were evicted by last 10 HIGH)

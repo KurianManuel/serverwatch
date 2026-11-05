@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from app.database.connection import _apply_pragmas, database_connection
-from app.database.migrations import run_migrations
+from app.database.migrations import SUPPORTED_VERSION, run_migrations
 
 
 class TestConnectionPRAGMAs:
@@ -124,7 +124,7 @@ class TestConnectionBehavior:
     def test_migrations_apply_pragmas(self, temp_db: str) -> None:
         """Verify migrations run with PRAGMAs applied."""
         version = run_migrations(temp_db)
-        assert version == 2
+        assert version == SUPPORTED_VERSION
 
         # Verify PRAGMAs still work after migration
         with database_connection(temp_db) as conn:

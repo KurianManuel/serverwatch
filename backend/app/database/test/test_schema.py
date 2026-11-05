@@ -6,7 +6,12 @@ from collections.abc import Callable
 import pytest
 
 from app.database.connection import database_connection
-from app.database.migrations import _has_application_tables, _validate_schema_v1, run_migrations
+from app.database.migrations import (
+    SUPPORTED_VERSION,
+    _has_application_tables,
+    _validate_schema_v1,
+    run_migrations,
+)
 
 REQUIRED_TABLES = {
     "servers", "cpu_samples", "memory_samples", "disk_samples",
@@ -98,7 +103,7 @@ class TestSchemaCreation:
         version1 = run_migrations(migrated_db)
         # Second run
         version2 = run_migrations(migrated_db)
-        assert version1 == version2 == 2
+        assert version1 == version2 == SUPPORTED_VERSION
 
 
 class TestSchemaValidation:

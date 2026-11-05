@@ -103,7 +103,7 @@ class TestMigrationSuccess:
         """Migration on fresh database succeeds to version 2."""
         version = run_migrations(temp_db)
         assert version == SUPPORTED_VERSION
-        assert version == 2
+        assert version == 3
 
     def test_version_recorded_after_schema_creation(self, temp_db: str) -> None:
         """Version 2 is recorded only after all schema statements succeed."""
@@ -112,7 +112,7 @@ class TestMigrationSuccess:
             cursor = conn.execute("SELECT version FROM schema_metadata")
             row = cursor.fetchone()
             assert row is not None
-            assert row[0] == 2
+            assert row[0] == 3
 
     def test_idempotent_rerun(self, migrated_db: str) -> None:
         """Re-running migration on valid v2 database is a no-op."""
@@ -124,7 +124,7 @@ class TestMigrationSuccess:
         """Complete version-2 database remains an idempotent no-op."""
         version = run_migrations(migrated_db)
         assert version == SUPPORTED_VERSION
-        assert version == 2
+        assert version == 3
 
 
 class TestMigrationFailureHandling:
@@ -132,12 +132,12 @@ class TestMigrationFailureHandling:
 
     def test_unsupported_newer_version_rejected(self, temp_db: str) -> None:
         """Database with version > supported is rejected."""
-        # Manually create a schema_metadata with version 3
+        # Manually create a schema_metadata with version 4 (newer than supported 3)
         with database_connection(temp_db) as conn:
             conn.execute("CREATE TABLE schema_metadata (version INTEGER PRIMARY KEY, applied_at TIMESTAMP, description TEXT)")
-            conn.execute("INSERT INTO schema_metadata (version, description) VALUES (3, 'Future version')")
+            conn.execute("INSERT INTO schema_metadata (version, description) VALUES (4, 'Future version')")
 
-        with pytest.raises(MigrationError, match="Database version 3 > supported 2"):
+        with pytest.raises(MigrationError, match="Database version 4 > supported 3"):
             run_migrations(temp_db)
 
     def test_pre_existing_tables_without_metadata_rejected(self, temp_db: str) -> None:
@@ -179,7 +179,7 @@ class TestMigrationFailureHandling:
         with database_connection(temp_db) as conn:
             conn.execute("UPDATE schema_metadata SET version = 2")
 
-        with pytest.raises(MigrationError, match="required tables/indexes are missing"):
+        with pytest.raises(MigrationError, match="Migration completed but schema validation failed"):
             run_migrations(temp_db)
 
     def test_version2_missing_deduplication_table_rejected(self, temp_db: str) -> None:
@@ -190,7 +190,7 @@ class TestMigrationFailureHandling:
             # Drop the event_deduplication table if it exists
             conn.execute("DROP TABLE IF EXISTS event_deduplication")
 
-        with pytest.raises(MigrationError, match="required tables/indexes are missing"):
+        with pytest.raises(MigrationError, match="Migration completed but schema validation failed"):
             run_migrations(temp_db)
 
     def test_version2_missing_fingerprint_column_rejected(self, temp_db: str) -> None:
@@ -214,7 +214,7 @@ class TestMigrationFailureHandling:
             conn.execute("DROP TABLE events")
             conn.execute("ALTER TABLE events_new RENAME TO events")
 
-        with pytest.raises(MigrationError, match="required tables/indexes are missing"):
+        with pytest.raises(MigrationError, match="Migration completed but schema validation failed"):
             run_migrations(temp_db)
 
 
@@ -300,9 +300,9 @@ class TestTransactionRollback:
             }
             assert required_indexes.issubset(indexes), f"Missing indexes: {required_indexes - indexes}"
 
-            # Verify schema version is 2
+            # Verify schema version is 3
             cursor = conn.execute("SELECT version FROM schema_metadata")
-            assert cursor.fetchone()[0] == 2
+            assert cursor.fetchone()[0] == SUPPORTED_VERSION
 
     def test_retry_after_rollback_succeeds(self, temp_db: str, monkeypatch: pytest.MonkeyPatch) -> None:
         """After a rollback, retrying migration succeeds (separate verification)."""
@@ -337,7 +337,7 @@ class TestTransactionRollback:
             assert "cpu_samples" in tables
             assert "schema_metadata" in tables
             cursor = conn.execute("SELECT version FROM schema_metadata")
-            assert cursor.fetchone()[0] == 2
+            assert cursor.fetchone()[0] == SUPPORTED_VERSION
 
 
 class TestMigrationValidation:
@@ -432,7 +432,7 @@ class TestMigrationIdempotence:
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
             )
             table_count = cursor.fetchone()[0]
-            assert table_count == 13  # 12 application tables + sqlite_sequence
+            assert table_count == 14  # 13 application tables + sqlite_sequence
 
     def test_no_duplicate_schema_metadata_on_rerun(self, migrated_db: str) -> None:
         """Re-running doesn't create duplicate schema_metadata entries."""
@@ -447,7 +447,7 @@ class TestMigrationIdempotence:
         """Version stays at 2 after multiple runs."""
         for _ in range(5):
             version = run_migrations(migrated_db)
-            assert version == 2
+            assert version == SUPPORTED_VERSION
 
 
 class TestMigrationEdgeCases:
@@ -479,7 +479,7 @@ class TestMigrationEdgeCases:
         from app.database.connection import database_connection
         with database_connection(db_path) as conn:
             cursor = conn.execute("SELECT version FROM schema_metadata")
-            assert cursor.fetchone()[0] == 2
+            assert cursor.fetchone()[0] == SUPPORTED_VERSION
 
     def test_database_creation_creates_parent_directories(self, tmp_path: Path) -> None:
         """database_connection creates parent directories if they don't exist."""
